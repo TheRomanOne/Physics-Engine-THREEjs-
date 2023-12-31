@@ -1,3 +1,4 @@
+__INFINITY__ = 99999
 __MOVE_SCALE__ = 10
 __GRAVITY__ = 5
 __EPSILON__ = .0001
@@ -116,28 +117,27 @@ let createObject = (context, props) =>
             shader_type = SHADER_TYPES.BASIC,
             position = [0, 0, 0],
             rotation = [0, 0, 0],
-            scale = [0, 0, 0],
+            params = [0, 0, 0],
             color = 0xaaabaa,
             castShadow = true,
             receiveShadow = true,
             shininess,
             setDepthMaterial = false,
             shaderUniforms={},
-            mass = 0,
-            has_target,
         } = props;
 
     let geomType = null
+
     switch(type)
     {
-        case "cube":        geomType = THREE.BoxGeometry; break
-        case "cylinder":    geomType = THREE.CylinderGeometry; break
-        case "tetrahedron": geomType = THREE.TetrahedronBufferGeometry; break
-        case "cone":        geomType = THREE.ConeGeometry; break
-        case "sphere":      geomType = THREE.SphereGeometry; break
+        case "cylinder":      geomType = THREE.CylinderGeometry; break
+        case "tetrahedron":   geomType = THREE.TetrahedronBufferGeometry; break
+        case "cube":          geomType = THREE.BoxGeometry; break
+        case "cone":          geomType = THREE.ConeGeometry; break
+        case "sphere":        geomType = THREE.SphereGeometry; break
     }
 
-    let geom = new geomType(...scale)
+    let geom = new geomType(...params)
 
     shaderUniforms = {
         ...shaderUniforms,
@@ -156,23 +156,281 @@ let createObject = (context, props) =>
     mesh.castShadow = castShadow;
     mesh.receiveShadow = receiveShadow;
 
-    mesh.entity = new THREE.Object3D()
-    if(mass > 0)
-    {
-        mesh.entity.acceleration = vec3(0, 0, 0)
-        mesh.entity.velocity = vec3(0, 0, 0)
-        mesh.entity.mass = mass
-        mesh.entity.time_lerp = 0
-    }
-
-    if(has_target)
-    {
-        mesh.entity.target = vec3()
-    }
     return mesh;
 }
 
+class Entity
+{
+    constructor(name, features, context)
+    {
+        this.name = name
+        let { mass=0 } = features
+        this.context = context
+        this.features = features
+        this.object = createObject(context, features)
+        context.scene.add(this.object)
+        
+        this.mass = mass
+        this.acceleration = vec3(0, 0, 0)
+        this.velocity = vec3(0, 0, 0)
+        this.time_lerp = 0
 
+        this.target = null
+        this.locked_target = false
+        this._ray_direction = vec3(0, -1, 0)
+        this.raycaster = new THREE.Raycaster(this.object.position, this._ray_direction);
+        // this.max_acc
+        this.assert_surface()
+    }    
+
+    look_at = point => this.object.lookAt(point)
+
+    cast_ray = direction =>
+    {
+        this._ray_direction = direction
+        let ints = this.raycaster.intersectObjects( this.context.scene.children, true );
+        return ints.length > 0 ? ints[0] : {distance: __INFINITY__}
+    }
+
+    create_target = () =>
+    {
+        this.target = createObject(this.context, {
+            type: 'sphere',
+            params: [.2, 5, 5],
+            position: [0, 0, 10]
+        })
+        this.object.add(this.target)
+    }
+
+    direction_to = v =>
+    {
+        let dv = get_distance_vector(this.get_position(), v)
+        dv.normalize()
+        return dv
+    }
+
+    distance_to = v => get_distance_vector(this.get_position(), v).length()
+    release_target = () =>
+    {
+        let t = vec3(0, 0, 10)
+        this.target.position.set(t.x, t.y, t.z)
+        this.locked_target = false
+        t = this.to_global(t)
+        this.object.lookAt(t)
+    }
+    set_target = v =>
+    {
+        this.object.lookAt(v)
+        v = this.to_local(v)
+        this.target.position.set(v.x, v.y + 2, v.z)
+        this.locked_target = true
+    }
+    add_acceleration = tr_move => this.acceleration.add(tr_move)
+
+    turn = a =>
+    {
+        // this.object.rotation.x -= a.z * Math.PI*2
+        this.object.rotation.x = 0
+        this.object.rotation.y -= a.x * Math.PI*2
+        this.object.rotation.z = 0
+    }
+
+    _apply_gravity = () =>
+    {
+        // Δv = a * Δt
+        this.acceleration.y -= __GRAVITY__
+        this.acceleration.multiplyScalar(1 - __AIR_RESISTANCE__)
+    }
+
+    assert_surface = () =>
+    {
+        this.ground = this.cast_ray(vec3(0, -1, 0))
+        if(this.ground.distance == __INFINITY__)
+            return
+
+        this.ground_point = this.ground.point
+        let { y } = this.ground_point.clone()
+        y += this.object.scale.y
+        if(this.get_position().y < y + __EPSILON__)
+        {   
+            this.ground.distance = 0
+            this.bounce(y)
+            this.apply_friction(__FRICTION__)
+        }
+    }
+
+    to_global = v => v.applyMatrix4(this.object.matrix)
+    to_local = v => v.applyMatrix4(this.object.matrix.transpose())
+
+    apply_force = f =>
+    {
+        let mv = f.clone()
+        mv.y = 0
+        let tr_move = this.to_global(mv)
+        tr_move.add(this.get_position().multiplyScalar(-1))
+        tr_move.y = f.y
+        this.add_acceleration(tr_move)
+        this.limit_acceleration()
+    }
+    
+    compute_physics = () =>
+    {
+        let limit_jump = false
+        if(this.mass > 0)
+        {
+            this._apply_gravity()
+            this.object.position.add(this.get_acceleration().multiplyScalar(this.context.deltaTime))
+            this.assert_surface()
+        }else
+        {
+            this.object.position.add(this.get_acceleration().multiplyScalar(this.context.deltaTime))
+            limit_jump = true
+        }
+
+        if(this.get_acceleration().length() < __EPSILON__)
+            this.freeze()
+        else 
+            this.time_lerp = clamp(this.time_lerp + this.context.deltaTime, 0, 2)
+
+        this.limit_acceleration(limit_jump)
+    }
+
+    limit_acceleration = limit_jump =>
+    {
+        let acc = this.acceleration
+        acc.x = clamp(acc.x, -__MAX_SPEED__, __MAX_SPEED__)
+        acc.z = clamp(acc.z, -__MAX_SPEED__, __MAX_SPEED__)
+        if(limit_jump)
+            acc.y = clamp(acc.y, -this.max_cc, this.max_cc)
+        // if(acc.length() > this.max_acc)
+        //     acc.multiplyScalar(.9)
+    }
+
+    bounce = from_height =>
+    {
+        this.object.position.y = from_height
+        this.acceleration.y *= - __BOUNCE__ // bounce
+    }
+
+    apply_friction = friction =>
+    {
+        let a = this.get_acceleration()
+        let h = a.y
+        
+        // check movement along xz axis
+        a.y = 0
+        if(a.length() > 0)
+        {
+            this.acceleration.multiplyScalar(1 - friction)
+            this.acceleration.y = h
+        }
+    }
+
+    freeze = () =>
+    {
+        this.acceleration.set(0, 0, 0)
+        this.time_lerp = 0 
+    }
+    get_acceleration = () => this.acceleration.clone()
+    get_position = () => this.object.position.clone()
+    get_target = () =>
+    {
+        let t = this.target.position.clone()
+        return this.locked_target ? t : this.to_global(t)
+    }
+
+    set_position = position =>
+    {
+        this.object.position.set(position.x, position.y, position.z)
+    }
+
+    add_magic_ball = features =>
+    {
+       let f = {...features}
+       delete f.shader_type
+       f.params = [.2, 32, 16]
+       f.type = 'sphere'
+    //    this.magic_ball = new Entity('magic', f, this.context)
+    //    this.magic_ball.create_target()
+    }
+}
+
+class Character extends Entity
+{
+    constructor(name, features, context)
+    {
+        features.type = 'sphere'
+        super(name, features, context)
+    }
+
+    add_hat = () =>
+    {
+        let f = {...this.features}
+        f.position = [0, f.params[0], 0]
+        f.params = [1.5, .7, 7]
+        f.type = "cone"
+        let hat = createObject(this.context, f)
+        this.object.add(hat)
+    }
+
+    add_sword = () =>
+    {
+        let f = {...this.features}
+        let h = f.params[0]
+        f.position = [-h, -.2 * h, 1]
+        f.params = [.1, 5, 12]
+        f.type = "cone"
+        f.rotation = [.45 * Math.PI, 0, 0]
+        let sword = createObject(this.context, f)
+        // sword.rotation.set(new THREE.Vector3());
+
+        this.object.add(sword)
+    }
+}
+
+class Player extends Character
+{
+    constructor(name, features, context)
+    {
+        super(name, features, context)
+        this.enemy = undefined
+    }
+
+
+    user_input = (move, turn) =>
+    {
+        if(this.ground.distance > 0)
+            move.y = 0
+
+        if(move.length() > 0)
+            this.apply_force(move)
+
+        if(turn.length() > 0)
+            this.turn(turn)
+    }
+
+    set_enemy = enemy =>
+    {
+        this.enemy = enemy
+    }
+
+    advance = () =>
+    {
+
+        if(this.enemy != undefined)
+            if(this.distance_to(this.enemy.get_position()) < 25)
+            {
+                
+                this.enemy.set_target(this.get_position())
+                if(this.enemy.ground.distance == 0)
+                    this.enemy.acceleration.y += 10
+                this.enemy.apply_force(vec3(Math.sin(Math.random() * 3.14 *2), 0, Math.sin(Math.random() * 3.14 *2)))
+                //if(!this.player.locked_target)
+                    this.set_target(this.enemy.get_position())
+            }else if(this.locked_target)
+                this.release_target()
+    }
+}
 
 // Scene
 class World
@@ -187,7 +445,6 @@ class World
         this.raycaster = new THREE.Raycaster(); 
         this.mouse = new THREE.Vector2();
         camera = new THREE.PerspectiveCamera(15, aspect, 0.1, 1000);
-        // camera.position.set(0, 10, -50)
         renderer = new THREE.WebGLRenderer({antialias: true});
         renderer.setSize(w, h);
         renderer.shadowMap.enabled = true;
@@ -197,7 +454,7 @@ class World
         this.time = 0
         this.deltaTime = 0
         scene = new THREE.Scene();
-        // this.entity.time_lerp = 0
+        // this.time_lerp = 0
         this.scene = scene;
         this.camera = camera;
         this.renderer = renderer;
@@ -211,119 +468,68 @@ class World
 
         this.clock = new THREE.Clock()
         this.material_maker = new MaterialMaker(this)
+
+        // this.prev_mouse = undefined
     }
     
-    update_camera = stat =>
+    update_camera = () =>
     {
-        let {
-            position,
-            look_at = this.player.position,
-        } = stat
+        let target = this.player.get_target()
+        target.y = 0
 
-        let la = this.enemy.position.clone()
-        la.y = 0
+        let pl_p = this.player.get_position()
+        let dir = this.player.direction_to(target).multiplyScalar(60)
+        let p = pl_p.clone().add(dir)
+        p.y += 10
+        p = p.lerp(this.camera.position, __CAM_SPEED__)
+        this.camera.position.set(p.x, p.y, p.z)
 
-        if(position != undefined)
-            this.camera.position.set(...position)
-        else
-        {
-            let en_p = la.clone()
-            let pl_p = this.player.position.clone()
-            let dir = get_distance_vector(pl_p, en_p).normalize().multiplyScalar(50)
-            let p = pl_p.clone().add(dir)
-            p.y += 10
-            p = p.lerp(this.camera.position, __CAM_SPEED__)
-            this.camera.position.set(p.x, 10, p.z)
-        }
-        
-        // if(!(look_at instanceof THREE.Vector3))
-        //     look_at = vec3(look_at[0], look_at[1], look_at[2])    
-        
-        this.camera.lookAt(la)
+        target.y = 2
+        this.camera.lookAt(target)
     }
 
 
-    physics = () =>
+    physics = (init=false) =>
     {
         this.masses.forEach(m =>
         {
-            if(m.entity.acceleration.length() > 0)
+            if(init || m.get_acceleration().length() > 0)
             {
-                let { mass, velocity, acceleration } = m.entity
-
-                acceleration.y -= __GRAVITY__
-                acceleration.multiplyScalar(1 - __AIR_RESISTANCE__)
-                // Δv = a * Δt
-                m.position.add(acceleration.clone().multiplyScalar(this.deltaTime))
-                
-                
-                if(m.entity.acceleration.length() < __EPSILON__)
-                {
-                    m.entity.acceleration.set(0, 0, 0)
-                    m.entity.time_lerp = 0
-                }else m.entity.time_lerp = clamp(m.entity.time_lerp + this.deltaTime, 0, 2)
-
-                if(m.position.y < __EPSILON__)
-                {
-                    m.position.y = 0
-                    m.entity.acceleration.y *= - __BOUNCE__ // bounce
-                    let a = acceleration.clone()
-                    a.y = 0
-                    if(a.length() > 0)
-                    {
-                        a = acceleration.clone()
-                        acceleration.multiplyScalar(1 - __FRICTION__)
-                        acceleration.y = a.y
-                    }
-                }
-                
+                m.compute_physics()
             }
         })
     }
 
-    move = () =>
+    user_input = () =>
     {
         let move = vec3(0, 0, 0)
-        if(keysPressed["ArrowUp"] || keysPressed["KeyW"])
-            move.z =  __MOVE_SCALE__
-        if(keysPressed["ArrowDown"] || keysPressed["KeyS"])
-            move.z = - __MOVE_SCALE__
-        if(keysPressed["ArrowLeft"] || keysPressed["KeyA"])
-            move.x =  __MOVE_SCALE__
-        if(keysPressed["ArrowRight"] || keysPressed["KeyD"])
-            move.x = - __MOVE_SCALE__
+        let turn = vec3(0, 0, 0)
+        if(keysPressed["KeyW"]) move.z =  __MOVE_SCALE__
+        if(keysPressed["KeyS"]) move.z = - __MOVE_SCALE__
+        if(keysPressed["KeyA"]) move.x =  __MOVE_SCALE__
+        if(keysPressed["KeyD"]) move.x = - __MOVE_SCALE__
+        if(keysPressed["Space"]) move.y =  __MOVE_SCALE__
 
-        if(keysPressed["Space"])
-        {
-            if(this.player.position.y == 0)
-            {
-                move.y =  __MOVE_SCALE__
-            }
-        }
-        
-        if(move.length() > 0)
-        { 
-            let mv = move.clone()
-            mv.y = 0
-            let tr_move = this.loc2glob(this.player, mv)
-            // tr_move.add(this.player.position.clone().multiplyScalar(-1))
-            let { acceleration } = this.player.entity
-            acceleration.x += tr_move.x
-            acceleration.y += move.y
-            acceleration.z += tr_move.z
+        if(keysPressed["ArrowUp"]) turn.z -= .005
+        if(keysPressed["ArrowDown"]) turn.z += .005
+        if(keysPressed["ArrowLeft"]) turn.x -= .005
+        if(keysPressed["ArrowRight"]) turn.x += .005
 
-            acceleration.x = clamp(acceleration.x, -__MAX_SPEED__, __MAX_SPEED__)
-            // acceleration.y = clamp(acceleration.y, 0, 50)
-            acceleration.z = clamp(acceleration.z, -__MAX_SPEED__, __MAX_SPEED__)
-        }
+        this.player.user_input(move, turn)
     }
     
-    loc2glob = (obj, v) =>
-    {
-        let tr_move = v.applyMatrix4(obj.matrix)
-        tr_move.add(this.player.position.clone().multiplyScalar(-1))
-        return tr_move
-    }
+    // cast_mouse_ray(event)
+    // {
+    //     this.mouse.x = ( event.clientX / window.innerWidth ) * 2 - 1; 
+    //     this.mouse.y = - ( event.clientY / window.innerHeight ) * 2 + 1; 
+        
+    //     this.raycaster.setFromCamera( this.mouse, this.camera );
+    //     // calculate objects intersecting the picking ray 
+    //     let ints = this.raycaster.intersectObjects( this.scene.children, true );
+    //     // printf(ints)
+    //     return ints;
+    // }
+
     setEventListeners()
     {
         document.body.onresize = () =>
@@ -335,7 +541,25 @@ class World
 
         addEventListener( 'click', e => {}, false );  
 
-        addEventListener('mousemove', e => {});
+        addEventListener('mousedown', e =>
+        {
+            // let t = createObject(this,
+            //     {
+            //         position: this.player.ground_point,
+            //         type: 'sphere',
+            //         params: [2, 32, 16]
+            //     })
+            // this.scene.add(t)
+        });
+
+        addEventListener('mousemove', e =>
+        {
+            // let mouse = new THREE.Vector3(e.pageX / window.innerWidth, 0, e.pageY / window.innerHeight)
+            // mouse.x -= .5
+            // mouse.z -= .5
+            // mouse.z /= 4
+            // this.player.turn(mouse)
+        });
 
         addEventListener("keydown", event =>
         {
@@ -355,30 +579,30 @@ class World
         this.let_there_be_light()        
         this.init_characters()
         this.create_world()
-        this.player.target
-
-        let v = vec3(0, 0, 1)
+        this.physics(true)      
     }
     create_world = () =>
     {
-        this.ground = createObject( this, {
+        let features = {
             type: "cube",
-            scale: [50, 2, 50],
+            params: [100, 2, 100],
             setDepthMaterial: true,
             color: new THREE.Color(...[0.447, 0.941, .4]),
             castShadow: true,
             position: [0, -2, 0],
             shader_type: SHADER_TYPES.PHONG,
-            shininess:0
-        })
-
-        this.scene.add(this.ground)
+            shininess:0,
+        }
+        this.ground = new Entity("Ground", features, this)
+        this.scene.add(this.ground.object)
     }
     init_characters = () =>
     {
         this.masses = []
-        this.create_player()
-        this.create_enemy()
+        this.create_player([0, 5, -20])
+        this.create_enemy([0, 5, 20])
+
+        this.player.set_enemy(this.enemy)
     }
     let_there_be_light = () =>
     {
@@ -408,50 +632,49 @@ class World
         
         this.lights.add( this.ambient );
     }
-    create_player = () =>
+    create_player = (position) =>
     {
-        this.player = createObject(this, {
-            position: [0, 0, -10],
-            scale: [1, 32, 16],
+        let features = {
+            position: position,
+            params: [1, 32, 16],
             color: 0xff3333,
-            type: 'sphere',
-            shader_type: SHADER_TYPES.PHONG,
-            mass: __MASS__,
             name: "Player",
-            has_target: true
-        })
-
-        this.player.magic_ball = createObject(this, {
-            position: this.player.position.clone().add(vec3(Math.random(), Math.random(), Math.random()).normalize().multiplyScalar(3)),
-            scale: [.2, 32, 16],
+            mass: __MASS__,
+            shader_type: SHADER_TYPES.PHONG
+        }
+        let magic_features = {
+            position: vec3(...position).clone().add(vec3(Math.random(), Math.random(), Math.random()).normalize().multiplyScalar(3)),
             color: 0xff5555,
-            type: 'sphere',
-        })
-        this.scene.add(this.player.magic_ball)
+        }
+        this.player = new Player('Player', features, this)
+        this.player.add_hat()
+        this.player.add_sword()
+        this.player.create_target()
+        // this.player.add_magic_ball(magic_features)
         this.masses.push(this.player)
-        this.scene.add(this.player)
+        
     }
 
-    create_enemy = () =>
+    create_enemy = (position) =>
     {
-        this.enemy = createObject(this, {
-            position: [0, 0, 10],
-            scale: [1, 32, 16],
+        let features = {
+            position: position,
+            params: [1, 32, 16],
             color: 0x3333ff,
-            type: 'sphere',
-            shader_type: SHADER_TYPES.PHONG,
             name: 'Enemy',
-            mass: __MASS__ * 3.4
-        })
-        this.enemy.magic_ball = createObject(this, {
-            position: this.enemy.position.clone().add(vec3(Math.random(), Math.random(), Math.random()).normalize().multiplyScalar(3)),
-            scale: [.2, 32, 16],
+            mass: __MASS__ * 3.4,
+            shader_type: SHADER_TYPES.PHONG
+        }
+        let magic_features = {
+            position: vec3(...position).add(vec3(Math.random(), Math.random(), Math.random()).normalize().multiplyScalar(3)),
             color: 0x5555ff,
-            type: 'sphere',
-        })
-        this.scene.add(this.enemy.magic_ball)
+        }
+        this.enemy = new Character('Enemy', features, this)
+        this.enemy.add_hat()
+        this.enemy.add_sword()
+        this.enemy.create_target()
+        // this.enemy.add_magic_ball(magic_features)
         this.masses.push(this.enemy)
-        this.scene.add(this.enemy)
     }
     get_shader_ids() { return Object.keys(this.shaders) }
     
@@ -459,28 +682,26 @@ class World
     {
         this.deltaTime = this.clock.getDelta()
         this.time += this.deltaTime
-        this.player.lookAt(this.player.entity.target)
-        this.move()
+        // this.player.set_target(this.player.target.position)
         this.physics()
-        this.update_camera({})
-        // if(this.enemy.position.y < __EPSILON__)
-        //     this.enemy.entity.acceleration.y += 10
+        this.update_camera()
+        this.user_input()
         
-        // if(get_distance_vector(this.player.position, this.player.enemy).length() < 50)
-        {
-            this.player.target = this.enemy.position.clone()
-        }
+        this.player.advance()
+
         this.masses.forEach(m =>
         {
-            let {position} = m
-            let p = m.magic_ball.position
-            let _p = position.clone()
-            _p.y += 2
-            let dist_v = get_distance_vector(_p, p)
-            let dist = Math.max(0, dist_v.length() - 1.5)
-            let dir = dist_v.clone().normalize()
-            let new_p = p.clone().add(dir.multiplyScalar(dist * .1)).add(vec3(Math.sin(this.time * 5)/100, Math.cos(this.time*10)/100, 0))
-            m.magic_ball.position.set(new_p.x, new_p.y, new_p.z)
+            // let position = m.get_position()
+            // let p = m.magic_ball.get_position()
+            // // position.y += 2
+            // let dist_v = get_distance_vector(position, p)
+            // let dist = Math.max(0, dist_v.length())
+            // let dir = dist_v.clone().normalize()
+
+            // m.magic_ball.set_target(position)
+            // m.magic_ball.apply_force(vec3(0, 0, 1).multiplyScalar(.9 * dist))
+            // // m.magic_ball.apply_force(dir.multiplyScalar(.9 * dist))
+            // m.magic_ball.compute_physics()
             
         })
         // let ids = this.get_shader_ids()       
