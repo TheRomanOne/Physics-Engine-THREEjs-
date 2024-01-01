@@ -1,6 +1,6 @@
 __INFINITY__ = 99999
-__MOVE_SCALE__ = 50
-__GRAVITY__ = 9.8
+__MOVE_SCALE__ = 150
+__GRAVITY__ = 10
 __EPSILON__ = .0001
 __AIR_RESISTANCE__ = .001
 __FRICTION__ = .3
@@ -48,11 +48,9 @@ let max3 = (v, value) => vec3(
 let sign3 = v => vec3(Math.sign(v.x),Math.sign(v.y),Math.sign(v.z)
 )
 
-let CATALOGUE = makeEnum([
-    
-])
-
-let get_distance_vector = (v1, v2) => v1.clone().add(v2.clone().multiplyScalar(-1))
+let add = (v1, v2) => v1.clone().add(v2.clone())
+let subtract = (v1, v2) => v1.clone().add(v2.clone().multiplyScalar(-1))
+let mul = (v1, v2) => vec3().multiplyVectors(v1, v2)
 
 let createLight = (props) =>
 {
@@ -200,14 +198,14 @@ class Entity
         this.acceleration = vec3()
         this.velocity = vec3()
         this.momentum = vec3()
-        this.time_lerp = 0
 
         this.target = null
         this.locked_target = false
         this._ray_direction = vec3(0, -1, 0)
         this.raycaster = new THREE.Raycaster(this.object.position, this._ray_direction);
-        this.force = vec3()
-        this.is_walking = false
+        this.acting_force = vec3()
+        this.delta_force = vec3()
+        this.in_motion = false
 
         this.sides = [
             vec3(1, 0, 0), vec3(-1, 0, 0),
@@ -219,7 +217,7 @@ class Entity
         // {
         //     this.sides.push(vec3(i, j, k))
         // })))
-        this._check_collisions()
+        // this._check_collisions()
     }    
 
     look_at = point => this.object.lookAt(point)
@@ -246,11 +244,11 @@ class Entity
         
     to_global = v => v.applyMatrix4(this.object.matrix)
     to_local = v => v.applyMatrix4(this.object.matrix.transpose())
-    distance_to = v => get_distance_vector(this.get_position(), v).length()
+    distance_to = v => subtract(this.get_center(), v).length()
 
     direction_to = v =>
     {
-        let dv = get_distance_vector(this.get_position(), v)
+        let dv = subtract(this.get_center(), v)
         dv.normalize()
         return dv
     }
@@ -276,62 +274,42 @@ class Entity
     _apply_gravity = () =>
     {
         // F = m * g
-        this.force.y -= this.mass * __GRAVITY__
-        // this.acceleration.multiplyScalar(1 - __AIR_RESISTANCE__)
+        this.add_force(vec3(0, -__GRAVITY__ * this.mass, 0))
     }
 
     _collide = surface =>
     {
         if(surface.distance == __INFINITY__)
             return false
+
         let s = this.get_size()
-        if(2*s.length() < surface.distance)
+
+        if(s.length() < surface.distance)
             return false
 
-        let sp = surface.point.clone()
-        let bp = this.get_position()
-        let next_bp = bp.clone().add(this._calculate_delta_position(
-            this.get_velocity(),
-            this.get_acceleration(),
-            this.context.deltaTime*.1
-        ))
-        let s1 = sign3(bp.clone().add(sp.clone().multiplyScalar(-1)))
-        let s2 = sign3(next_bp.clone().add(sp.clone().multiplyScalar(-1)))
-        let boo2l = false
-        if(s1.x != 0)
-        {
-            boo2l |= s1.x - s2.x != 0
-        }
-        if(s1.y != 0)
-        {
-            boo2l |= s1.y - s2.y != 0
-        }
-        if(s1.z != 0)
-        {
-            boo2l |= s1.z - s2.z != 0
-        }
-        if(surface.distance < 5 && this.name == "ball" && surface.object.name == "wall_center")
-        {
-            console.log(surface.object.name, surface.distance)
-        }
-        
         let p = surface.point.clone()
+        let v = this.get_velocity()
         let n = surface.face.normal.clone()
         n = surface.object.entity.direction_to_global(n)
-        p.add(s.multiplyVectors(sign3(n), s.multiplyScalar(.5)))
+        p = add(p, mul(n, s.multiplyScalar(.5)))
         
-        let pos = this.get_position()
-        let np = pos.clone().add(p.clone().multiplyScalar(-1))
-        let mask = vec3().multiplyVectors(np, sign3(n))
+        let pos = this.get_center()
+        let np = subtract(pos, p)
+        let mask = mul(np, sign3(n))
         let e = __EPSILON__
-        // e = .1
+        
         let bool = mask.x < e && mask.y < e && mask.z < e
         
+        
+        // if(this.name == "ball")
+        // {
+        //     console.log(surface.object.name, surface.distance, v)
+        // }
         if(bool)
         {   
             surface.distance = 0
-            this.bounce(p, n)
-            this.apply_friction(__FRICTION__)
+            this._bounce(p, n)
+            this._apply_friction(__FRICTION__)
             return true
         }
         return false
@@ -352,7 +330,7 @@ class Entity
     direction_to_global = d =>
     {
         d = this.to_global(d)
-        d.add(this.get_position().multiplyScalar(-1))
+        d.add(this.get_center().multiplyScalar(-1))
         return d
     }
 
@@ -364,12 +342,6 @@ class Entity
             this._check_collisions()
         }
 
-        if(this.is_walking)
-        {
-            let v = this.get_velocity().length()
-            if(v < 0.35)
-                this.halt()
-        }
         this._calculate_state()
 
     }
@@ -397,95 +369,108 @@ class Entity
         
         // a = f / m
         // Δv = a * Δt
+        f = add(f, this.delta_force)
         a = f.clone().multiplyScalar(1 / m)
         v.add(a.clone().multiplyScalar(t))
 
         let dx = this._calculate_delta_position(v, a, t)
         p.add(dx)
         
+        if(v.length() < .05 && this.get_net_force().length() < __EPSILON__)
+            this.halt()
+        else
+            this.in_motion = true
         // (momentum) p = m*v 
         this.set_momentum(v.clone().multiplyScalar(m))
         this.set_acceleration(a)
         this.set_velocity(v)
-        this.set_position(p)
+        this.set_center(p)
+        this.set_force(f)
+        this.delta_force.set(0, 0, 0)
     }
 
     
     
-    apply_friction = friction =>
+    _apply_friction = friction =>
     {
         let dv = this.get_velocity()
-        let mid_jump = dv.y > 0
+        //let mid_jump = dv.y > 0
         dv.y = 0 // check movement along xz axis
         if(dv.length() > 0)
         {
-            if(!this.is_walking)
+            if(!this.in_motion)
             {
                 this.movement_axis = sign3(dv)
-                this.is_walking = true
+                this.in_motion = true
             }
             
-            {
-                let m = this.mass
-                let n = m * __GRAVITY__
-                let fm = n
-                let fa = vec3()
-                fa.x = -dv.x * fm       
-                fa.z = -dv.z * fm
-                
-                // reduce friction during bounce
-                if(mid_jump)
-                    fa.multiplyScalar(friction)
-                this.force.x += fa.x; this.force.x *= friction
-                this.force.z += fa.z; this.force.z *= friction
-            }
+            let m = this.mass
+            let n = m * __GRAVITY__
+            let fm = n
+            let fa = vec3()
+            fa.x = -dv.x * fm       
+            fa.z = -dv.z * fm
+            
+            // reduce friction during bounce
+            // if(mid_jump)
+                fa.multiplyScalar(friction)
+            this.add_force(fa)
+            this.acting_force = mul(this.acting_force, vec3(friction, 0, friction))
+            // this.acting_force.x += fa.x; this.acting_force.x *= friction
+            // this.acting_force.z += fa.z; this.acting_force.z *= friction
         }
     }
 
     halt = () =>
     {
-        this.is_walking = false    
+        this.in_motion = false    
         this.acceleration.set(0, 0, 0)
         this.velocity.set(0, 0, 0)
-        this.force.set(0, 0, 0)
+        this.acting_force.set(0, 0, 0)
+        this.delta_force.set(0, 0, 0)
         this.momentum.set(0, 0, 0)
-        this.time_lerp = 0 
+        this.in_motion = false
     }
 
-    bounce = (position, normal) =>
+    _bounce = (center, normal) =>
     {
-        this.set_position(position)
+        this.set_center(center)
+        // normal force
+        let f = normal.clone().multiplyScalar(-__GRAVITY__ * this.mass * this.context.deltaTime)
+        this.add_force(f)
         let mask = sign3(normal).multiplyScalar(-.2*__BOUNCE__)
         mask.multiplyVectors(mask, normal)
         if(mask.x != 0)
         {
-            this.force.x *= mask.x
+            this.acting_force.x *= mask.x
             this.acceleration.x *=mask.x
             this.velocity.x *= mask.x
         }
         if(mask.y != 0)
         {
-            this.force.y *= mask.y
+            this.acting_force.y *= mask.y
             this.acceleration.y *=mask.y
             this.velocity.y *= mask.y
         }
         if(mask.z != 0)
         {
-            this.force.z *= mask.z
+            this.acting_force.z *= mask.z
             this.acceleration.z *=mask.z
             this.velocity.z *= mask.z
         }
     }
 
+    get_movement_direction = () => this.get_velocity().normalize()
     get_acceleration = () => this.acceleration.clone()
     get_velocity = () => this.velocity.clone()
-    get_position = () => this.object.position.clone()
+    get_center = () => this.object.position.clone()
     get_size = () => this.object.size.clone()
-    get_force = () => this.force.clone()
+    get_force = () => this.acting_force.clone()
+    get_net_force = () => add(this.acting_force, this.delta_force)
     get_momentum = () => this.momentum.clone()
     add_acceleration = acc => this.acceleration.add(acc)
     add_velocity = vel => this.velocity.add(vel)
-    add_force = force => this.force.add(force)
+    add_force = force => this.delta_force.add(force)
     get_target = () =>
     {
         let t = this.target.position.clone()
@@ -496,16 +481,17 @@ class Entity
         return {
             acceleration: this.get_acceleration(),
             velocity: this.get_velocity(),
-            position: this.get_position(),
+            position: this.get_center(),
             force: this.get_force(),
             momentum: this.get_momentum()
         }
     }
     
-    set_position = position => this.object.position.set(position.x, position.y, position.z)
-    set_velocity = velocity => this.velocity.set(velocity.x, velocity.y, velocity.z)
-    set_acceleration = acceleration => this.acceleration.set(acceleration.x, acceleration.y, acceleration.z)
-    set_momentum = momentum => this.momentum.set(momentum.x, momentum.y, momentum.z)    
+    set_center = position => this.object.position.copy(position)
+    set_velocity = velocity => this.velocity.copy(velocity)
+    set_acceleration = acceleration => this.acceleration.copy(acceleration.x)
+    set_force = force => this.acting_force.copy(force)
+    set_momentum = momentum => this.momentum.copy(momentum)
     set_target = v =>
     {
         this.object.lookAt(v)
@@ -528,9 +514,14 @@ class Character extends Entity
 
     throw_ball = seconds =>
     {
-        let r = .3+.7*rnd()
-        let o = this.get_position().add(vec3(0, 2, 0))
-        let d = this.direction_to_global(vec3(0, .02, .07))
+        // looks like ball stays alive after timeout. check referances to it
+        let r = .5 + .7*rnd()
+        let o = add(this.get_center(), vec3(0, 2, 0))
+        let d = this.direction_to_global(vec3(0, .1, .7).normalize())
+        let mv = this.get_movement_direction()
+        mv = mul(mv, vec3(.1, 0, .1))
+        d = add(d, mv).normalize()
+        console.log(d)
         let t = SHADER_TYPES.PHONG
         let light = null
         let c = new THREE.Color(...[.2 + .7 * rnd(), .2 + .7 * rnd(), .2 + .7 * rnd()])
@@ -551,10 +542,10 @@ class Character extends Entity
             type: "sphere", params: [r, 32, 16],
             color: c, castShadow: true,
             position: o, shader_type:  t,
-            mass: .4
+            mass: 1
         }
         let ball = new Entity("ball", features, this.context)
-        ball.add_velocity(d.multiplyScalar(500))
+        ball.add_velocity(d.multiplyScalar(100))
         if(light != null) ball.object.add(light)
         let i = this.temp.length
         setTimeout(() =>
@@ -608,11 +599,12 @@ class Player extends Character
         if(this.ground.distance == 0 && move.length() > 0)
         {
             // move only when on the ground
-            let { y } = move
+            let { y: jump } = move
             move.multiplyScalar(this.move_force)
             move.y=0
-            this.force.add(move)
-            this.velocity.y = y * this.jump_force
+            this.add_force(move)
+            if(jump > 0)
+                this.velocity.y = jump * this.jump_force
         }
 
         if(turn.length() > 0)
@@ -631,14 +623,14 @@ class Player extends Character
     {
 
         // if(this.enemy != undefined)
-        //     if(this.distance_to(this.enemy.get_position()) < 25)
+        //     if(this.distance_to(this.enemy.get_center()) < 25)
         //     {
                 
-                // this.enemy.set_target(this.get_position())
+                // this.enemy.set_target(this.get_center())
                 // if(this.enemy.ground.distance == 0)
                 //     this.enemy.acceleration.y += 20
                 // this.enemy.apply_force(vec3(Math.sin(rnd() * 3.14 *2), 0, Math.sin(rnd() * 3.14 *2)))
-                    // this.set_target(this.enemy.get_position())
+                    // this.set_target(this.enemy.get_center())
         //     }else if(this.locked_target)
         //         this.release_target()
     }
@@ -666,8 +658,8 @@ class World
         this.time = 0
         this.deltaTime = 0
         scene = new THREE.Scene();
-        // this.time_lerp = 0
         this.scene = scene;
+        this.scene.background = new THREE.Color(0x5c87b8)
         this.camera = camera;
         this.renderer = renderer;
         this.shaders = {}
@@ -691,9 +683,9 @@ class World
         target.y = 0
         target.y = 0
 
-        let pl_p = this.player.get_position()
+        let pl_p = this.player.get_center()
         let dir = this.player.direction_to(target).multiplyScalar(50)
-        let p = pl_p.clone().add(dir)
+        let p = add(pl_p, dir)
         p.y = 7
         p = p.lerp(this.camera.position, __CAM_SPEED__)
         this.camera.position.set(p.x, p.y, p.z)
@@ -705,10 +697,10 @@ class World
 
     physics = () =>
     {
+        if(this.deltaTime == 0)
+            return
         this.masses.forEach(m =>
         {
-            // if(m.name == "ball")
-            // console.log(0)
             m.compute_physics()
         })
     }
@@ -785,7 +777,7 @@ class World
 
     restart = () =>
     {
-        this.player.set_position(vec3([0, 5, -20]))
+        this.player.set_center(vec3([0, 5, -20]))
     }
 
     initScene()
@@ -807,20 +799,20 @@ class World
             shader_type: SHADER_TYPES.PHONG,
             shininess:0,
         }
-        let h = 10
-        let w1 = { ...features, position: vec3(0, 2, 50), params: [50, h, 3] }
-        let w2 = { ...w1, position: vec3(25, 2, 49), rotation: [0, 3.14/8, 0] }
-        let w3 = { ...w1, position: vec3(-25, 2, 49), rotation: [0, -3.14/8, 0] }
+        let h = 7
+        let w1 = { ...features, position: vec3(0, h/2, 45), params: [20, h, 3] }
+        let w2 = { ...w1, position: vec3(10, h/2, 43), rotation: [0, 3.14/7, 0] }
+        let w3 = { ...w1, position: vec3(-10, h/2, 43), rotation: [0, -3.14/7, 0] }
         
         new Entity("ground", features, this)
         new Entity("wall_center", w1, this)
-        new Entity("wall_left", w2, this)
-        new Entity("wall_right", w3, this)
+        new Entity("wall_right", w2, this)
+        new Entity("wall_left", w3, this)
     }
     init_characters = () =>
     {
         this.masses = []
-        this.create_player([0,5 , -20])
+        this.create_player([0, 6 , 0])
         // this.create_enemy([0,5, 20])
 
         // this.player.set_enemy(this.wall)
@@ -847,7 +839,7 @@ class World
 
         this.ambient = createLight({
             type: "ambient",
-            color: 0x383838 ,
+            color: 0x484848 ,
             position: {x:0, y:100, z: 0}
         })
         
@@ -901,7 +893,7 @@ class World
         this.physics()
         this.update_camera()
 
-        if(this.player.get_position().y < -5)
+        if(this.player.get_center().y < -5)
             this.restart()
     }
 
@@ -938,7 +930,7 @@ window.onload = function()
     
     // String field
     let env1 = gui.addFolder('World')
-    env1.add(dt, "move", 1, 100).name("Movement").onChange(v => world.player.move_force =  v);
+    env1.add(dt, "move", 1, 1000).name("Movement").onChange(v => world.player.move_force =  v);
     env1.add(dt, "camera", 0, 1).name("Camera").onChange(c => __CAM_SPEED__ = c);
     env1.add(dt, "speed", 0, 100).name("Max Speed").onChange(c => __MAX_SPEED__ = c);
 
