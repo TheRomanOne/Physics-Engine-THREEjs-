@@ -3,12 +3,13 @@ __MOVE_SCALE__ = 150
 __GRAVITY__ = 10
 __EPSILON__ = .0001
 __AIR_RESISTANCE__ = .001
-__FRICTION__ = .3
+__FRICTION__ = .01
 __CAM_SPEED__ = .9
 __MAX_SPEED__ = 25
-__MASS__ = 2
+__MASS__ = 1
 __BOUNCE__ = .85
 
+let print = (...params) => console.log(...params)
 let rnd = () => Math.random()
 let rnd3 = () => vec3(rnd(), rnd(), rnd)
 let vec3 = (x, y, z) => new THREE.Vector3(x, y, z)
@@ -75,6 +76,68 @@ let createLight = (props) =>
         return _l;
 }
 
+class Dashboard
+{
+    constructor()
+    {
+        this.board = null
+        this.parameters3 = {
+            velocity: null,
+            acceleration: null,
+            force: null
+        }
+        this.parameters1 = {
+            time: 0
+        }
+        this.init()
+    }
+
+    set_value = (name, value) =>
+    {
+        if(value instanceof THREE.Vector3)
+        {
+            this.parameters3[name].x.innerHTML = value.x.toFixed(2)
+            this.parameters3[name].y.innerHTML = value.y.toFixed(2)
+            this.parameters3[name].z.innerHTML = value.z.toFixed(2)
+        }else
+        {
+            this.parameters1[name].innerHTML = '' + value.toFixed(2)
+        }
+    }
+
+    init = () =>
+    {
+        this.board = document.createElement('div')
+        this.board.classList.add('dashboard')
+        Object.keys(this.parameters3).forEach(param =>
+        {  
+            let v = document.createElement('div')
+            this.parameters3[param] = {}
+            v.classList.add(param)
+            let axis = ['x', 'y', 'z']
+            axis.forEach(a =>
+            {
+                let _a = document.createElement('div')  
+                this.parameters3[param][a] = _a
+                _a.classList.add(a)
+                _a.innerHTML = 0
+                v.appendChild(_a)
+            })
+            this.board.appendChild(v)
+            
+        })
+
+        Object.keys(this.parameters1).forEach(param =>
+        {  
+            let v = document.createElement('div')
+            this.parameters1[param] = v
+            v.classList.add(param)
+            this.board.appendChild(v)
+            
+        })
+        document.body.appendChild(this.board)
+    }
+}
 class MaterialMaker
 {
     constructor(context)
@@ -198,13 +261,13 @@ class Entity
         this.acceleration = vec3()
         this.velocity = vec3()
         this.momentum = vec3()
+        this.impulse = vec3()
 
         this.target = null
         this.locked_target = false
         this._ray_direction = vec3(0, -1, 0)
         this.raycaster = new THREE.Raycaster(this.object.position, this._ray_direction);
         this.acting_force = vec3()
-        this.delta_force = vec3()
         this.in_motion = false
 
         this.sides = [
@@ -274,6 +337,7 @@ class Entity
     _apply_gravity = () =>
     {
         // F = m * g
+        if(this.in_motion)
         this.add_force(vec3(0, -__GRAVITY__ * this.mass, 0))
     }
 
@@ -289,28 +353,39 @@ class Entity
 
         let p = surface.point.clone()
         let v = this.get_velocity()
+        let a = this.get_acceleration()
         let n = surface.face.normal.clone()
         n = surface.object.entity.direction_to_global(n)
-        p = add(p, mul(n, s.multiplyScalar(.5)))
+        let obj_position = add(p, mul(n, s.multiplyScalar(.5)))
         
         let pos = this.get_center()
-        let np = subtract(pos, p)
+        let np = subtract(pos, obj_position)
         let mask = mul(np, sign3(n))
-        let e = __EPSILON__
         
-        let bool = mask.x < e && mask.y < e && mask.z < e
-        
-        
-        // if(this.name == "ball")
-        // {
-        //     console.log(surface.object.name, surface.distance, v)
-        // }
-        if(bool)
-        {   
+        let dx = this._calculate_delta_position(v, a, this.context.deltaTime*2)
+        let np2 = subtract(add(pos, dx), obj_position)
+        let mask2 = mul(np2, sign3(n))
+
+        let m1 = sign3(mask)
+        let m2 = sign3(mask2)
+        let xx = m1.x != 0 && m1.x != m2.x
+        let yy = m1.y != 0 && m1.y != m2.y
+        let zz = m1.z != 0 && m1.z != m2.z
+
+        if(xx || yy || zz)
+        {
             surface.distance = 0
-            this._bounce(p, n)
+
+            // normal force
+            let f = n.clone().multiplyScalar(__GRAVITY__ * this.mass)
+            this.add_force(f)
+
+            this._bounce(obj_position, n)
             this._apply_friction(__FRICTION__)
-            return true
+
+            // if(this.get_velocity().length() < .5)
+            //     this.halt()
+            return true    
         }
         return false
     }
@@ -321,8 +396,12 @@ class Entity
         this.sides.forEach(d =>
         {
             let s = this.cast_ray(d)
+            if(d.y < 0)
+            {
+                this.ground = s
+                
+            }
             this._collide(s)
-            if(d.y < 0) this.ground = s
         })
 
     }
@@ -358,35 +437,45 @@ class Entity
 
     _calculate_state = () =>
     {
-        let t = this.context.deltaTime
+        let x = this.get_center()
+        let dt = this.context.deltaTime
         let m = this.mass
-        let {
-            acceleration: a,
-            velocity: v,
-            position: p,
-            force: f,
-        } = this.get_status()
         
-        // a = f / m
-        // Δv = a * Δt
-        f = add(f, this.delta_force)
-        a = f.clone().multiplyScalar(1 / m)
-        v.add(a.clone().multiplyScalar(t))
+        let v_current = this.get_velocity()
+        let p_current = this.get_momentum()
+        let j = this.get_impulse()
 
-        let dx = this._calculate_delta_position(v, a, t)
-        p.add(dx)
-        
-        if(v.length() < .05 && this.get_net_force().length() < __EPSILON__)
+        // if(this.context.time > 1)
+        //     print(0)
+        // a = f / m
+        // Δv = Δp / m
+        let p_new = add(p_current, j)
+        let v_new = p_new.clone().multiplyScalar(1/m)
+        let delta_v = subtract(v_new, v_current)
+        let a = delta_v.clone().multiplyScalar(dt)
+        let dx = this._calculate_delta_position(v_new, a, dt)
+        x.add(dx)
+        if(this.in_motion && this.get_velocity().length() < 10)
             this.halt()
         else
             this.in_motion = true
-        // (momentum) p = m*v 
-        this.set_momentum(v.clone().multiplyScalar(m))
-        this.set_acceleration(a)
-        this.set_velocity(v)
-        this.set_center(p)
-        this.set_force(f)
-        this.delta_force.set(0, 0, 0)
+        {
+            // (momentum) p = m*v 
+            this.set_momentum(p_new)    
+            this.set_acceleration(a)
+            this.set_velocity(v_new)
+            this.set_center(x)
+            // this.set_force(f)
+            this.impulse.set(0, 0, 0)
+        }
+        if(this.dashboard != undefined)
+        {
+            this.dashboard.set_value("velocity", v_new)
+            this.dashboard.set_value("acceleration", a)
+            // this.dashboard.set_value("momentum", p_new)
+            // if(v.length() < .1)
+            //     print(0)
+        }
     }
 
     
@@ -398,11 +487,11 @@ class Entity
         dv.y = 0 // check movement along xz axis
         if(dv.length() > 0)
         {
-            if(!this.in_motion)
-            {
-                this.movement_axis = sign3(dv)
-                this.in_motion = true
-            }
+            // if(!this.in_motion)
+            // {
+            //     this.movement_axis = sign3(dv)
+            //     this.in_motion = true
+            // }
             
             let m = this.mass
             let n = m * __GRAVITY__
@@ -423,11 +512,11 @@ class Entity
 
     halt = () =>
     {
-        this.in_motion = false    
+        console.log("object halted")
         this.acceleration.set(0, 0, 0)
         this.velocity.set(0, 0, 0)
         this.acting_force.set(0, 0, 0)
-        this.delta_force.set(0, 0, 0)
+        this.impulse.set(0, 0, 0)
         this.momentum.set(0, 0, 0)
         this.in_motion = false
     }
@@ -435,29 +524,24 @@ class Entity
     _bounce = (center, normal) =>
     {
         this.set_center(center)
-        // normal force
-        let f = normal.clone().multiplyScalar(-__GRAVITY__ * this.mass * this.context.deltaTime)
-        this.add_force(f)
-        let mask = sign3(normal).multiplyScalar(-.2*__BOUNCE__)
-        mask.multiplyVectors(mask, normal)
-        if(mask.x != 0)
-        {
-            this.acting_force.x *= mask.x
-            this.acceleration.x *=mask.x
-            this.velocity.x *= mask.x
-        }
-        if(mask.y != 0)
-        {
-            this.acting_force.y *= mask.y
-            this.acceleration.y *=mask.y
-            this.velocity.y *= mask.y
-        }
-        if(mask.z != 0)
-        {
-            this.acting_force.z *= mask.z
-            this.acceleration.z *=mask.z
-            this.velocity.z *= mask.z
-        }
+
+        // normal = normal.clone().multiplyScalar(-1)
+        // F = Δp / Δt
+        let m = this.mass
+        let v = this.get_velocity()
+        print(normal, v)
+        // let new_v = mul(v, mask)
+
+        let dot = v.clone().normalize().dot(normal)
+        let h = normal.clone().multiplyScalar(2 * dot * v.length())
+        let new_v = subtract(v, h)  // Calculate reflection vector
+
+        let delta_v = subtract(new_v, v)
+        let delta_p = delta_v.multiplyScalar(m)
+        this.add_momentum(delta_p)
+
+        if(this.name == "ball")
+        print(0)
     }
 
     get_movement_direction = () => this.get_velocity().normalize()
@@ -466,11 +550,12 @@ class Entity
     get_center = () => this.object.position.clone()
     get_size = () => this.object.size.clone()
     get_force = () => this.acting_force.clone()
-    get_net_force = () => add(this.acting_force, this.delta_force)
     get_momentum = () => this.momentum.clone()
+    get_impulse = () => this.impulse.clone()
     add_acceleration = acc => this.acceleration.add(acc)
     add_velocity = vel => this.velocity.add(vel)
-    add_force = force => this.delta_force.add(force)
+    add_force = force => this.impulse.add(force.clone().multiplyScalar(this.context.time))
+    add_momentum = momentum => this.impulse.add(momentum)
     get_target = () =>
     {
         let t = this.target.position.clone()
@@ -489,7 +574,7 @@ class Entity
     
     set_center = position => this.object.position.copy(position)
     set_velocity = velocity => this.velocity.copy(velocity)
-    set_acceleration = acceleration => this.acceleration.copy(acceleration.x)
+    set_acceleration = acceleration => this.acceleration.copy(acceleration)
     set_force = force => this.acting_force.copy(force)
     set_momentum = momentum => this.momentum.copy(momentum)
     set_target = v =>
@@ -516,12 +601,11 @@ class Character extends Entity
     {
         // looks like ball stays alive after timeout. check referances to it
         let r = .5 + .7*rnd()
-        let o = add(this.get_center(), vec3(0, 2, 0))
+        let o = add(this.get_center(), vec3(0, 3, 0))
         let d = this.direction_to_global(vec3(0, .1, .7).normalize())
-        let mv = this.get_movement_direction()
-        mv = mul(mv, vec3(.1, 0, .1))
-        d = add(d, mv).normalize()
-        console.log(d)
+        // let mv = this.get_movement_direction()
+        // mv = mul(mv, vec3(.1, 0, .1))
+        // d = add(d, mv).normalize()
         let t = SHADER_TYPES.PHONG
         let light = null
         let c = new THREE.Color(...[.2 + .7 * rnd(), .2 + .7 * rnd(), .2 + .7 * rnd()])
@@ -542,10 +626,10 @@ class Character extends Entity
             type: "sphere", params: [r, 32, 16],
             color: c, castShadow: true,
             position: o, shader_type:  t,
-            mass: 1
+            mass: .35
         }
         let ball = new Entity("ball", features, this.context)
-        ball.add_velocity(d.multiplyScalar(100))
+        ball.add_force(d.multiplyScalar(1500))
         if(light != null) ball.object.add(light)
         let i = this.temp.length
         setTimeout(() =>
@@ -592,6 +676,7 @@ class Player extends Character
     {
         super(name, features, context)
         this.enemy = undefined
+        this.dashboard = new Dashboard()
     }
 
     user_input = (move, turn) =>
@@ -604,7 +689,7 @@ class Player extends Character
             move.y=0
             this.add_force(move)
             if(jump > 0)
-                this.velocity.y = jump * this.jump_force
+                this.add_force(vec3(0, 100, 0))
         }
 
         if(turn.length() > 0)
@@ -732,7 +817,7 @@ class World
     //     this.raycaster.setFromCamera( this.mouse, this.camera );
     //     // calculate objects intersecting the picking ray 
     //     let ints = this.raycaster.intersectObjects( this.scene.children, true );
-    //     // printf(ints)
+    //     // print(ints)
     //     return ints;
     // }
 
@@ -792,6 +877,7 @@ class World
         let features = {
             type: "cube",
             params: [100, 2, 100],
+            rotation: [0, 0, 0],
             setDepthMaterial: true,
             color: new THREE.Color(...[0.447, 0.941, .4]),
             castShadow: true,
@@ -812,7 +898,7 @@ class World
     init_characters = () =>
     {
         this.masses = []
-        this.create_player([0, 6 , 0])
+        this.create_player([0, 3 , 0])
         // this.create_enemy([0,5, 20])
 
         // this.player.set_enemy(this.wall)
@@ -849,7 +935,7 @@ class World
     {
         let features = {
             position: position,
-            params: [1.5, 32, 16],
+            params: [2, 32, 16],
             color: 0xff3333,
             name: "Player",
             mass: __MASS__,
@@ -861,7 +947,6 @@ class World
         this.player.add_hat()
         this.player.add_sword()
         this.player.create_target()
-        
     }
 
     create_enemy = (position) =>
@@ -885,9 +970,10 @@ class World
     
     updateScene()
     {
-        this.deltaTime = Math.min(0.02, this.clock.getDelta())
+        this.deltaTime = Math.min(0.001, this.clock.getDelta())
+        
         this.time += this.deltaTime
-        // this.player.set_target(this.player.target.position)
+        this.player.dashboard.set_value("time", this.time)
         this.user_input()
         this.player.advance()
         this.physics()
@@ -928,7 +1014,6 @@ window.onload = function()
         bounce: __BOUNCE__,
     };
     
-    // String field
     let env1 = gui.addFolder('World')
     env1.add(dt, "move", 1, 1000).name("Movement").onChange(v => world.player.move_force =  v);
     env1.add(dt, "camera", 0, 1).name("Camera").onChange(c => __CAM_SPEED__ = c);
